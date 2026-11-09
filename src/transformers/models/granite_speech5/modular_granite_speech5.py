@@ -23,7 +23,7 @@ from ...configuration_utils import PreTrainedConfig
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
-from ...utils import TransformersKwargs, auto_docstring, logging
+from ...utils import TransformersKwargs, auto_docstring, is_torchdynamo_compiling, logging
 from ...utils.generic import merge_with_config_defaults
 from ...utils.output_capturing import capture_outputs
 from ..auto import AutoModel
@@ -247,10 +247,32 @@ class GraniteSpeech5EncoderConvolutionModule(nn.Module):
         if attention_mask is not None:
             hidden_states = hidden_states.masked_fill(~attention_mask.unsqueeze(-1), 0.0)
 
-        hidden_states = self.depthwise_conv(hidden_states.transpose(1, 2))
-        hidden_states = nn.functional.silu(self.norm(hidden_states))
-        hidden_states = self.pointwise_lin2(hidden_states.transpose(1, 2))
+        if is_torchdynamo_compiling() and not self.training:
+            hidden_states = self._depthwise_conv_norm_channels_last(hidden_states)
+        else:
+            hidden_states = self.depthwise_conv(hidden_states.transpose(1, 2))
+            hidden_states = self.norm(hidden_states).transpose(1, 2)
+        hidden_states = self.pointwise_lin2(nn.functional.silu(hidden_states))
         return hidden_states
+
+    # Compiled graphs are accelerated by this shifted multiply-add implementation that maintains channels-last layout,
+    # enabling `torch.compile` to fuse the GLU, masking, convolution, BatchNorm, and SiLU operations.
+    def _depthwise_conv_norm_channels_last(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        kernel_size, stride = self.depthwise_conv.kernel_size[0], self.depthwise_conv.stride[0]
+        padding = self.depthwise_conv.padding[0]
+        output_length = (hidden_states.shape[1] + 2 * padding - kernel_size) // stride + 1
+        hidden_states = nn.functional.pad(hidden_states, (0, 0, padding, padding))
+
+        scale = torch.rsqrt(self.norm.running_var.float() + self.norm.eps) * self.norm.weight.float()
+        weight = (self.depthwise_conv.weight[:, 0, :].float() * scale[:, None]).to(hidden_states.dtype)
+        bias = self.norm.bias.float() - self.norm.running_mean.float() * scale
+        if self.depthwise_conv.bias is not None:
+            bias = bias + self.depthwise_conv.bias.float() * scale
+
+        output = bias.to(hidden_states.dtype)
+        for k in range(kernel_size):
+            output = output + hidden_states[:, k : k + stride * (output_length - 1) + 1 : stride, :] * weight[:, k]
+        return output
 
 
 def downsample_attention_mask(attention_mask: torch.Tensor) -> torch.Tensor:
